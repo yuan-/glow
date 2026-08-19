@@ -99,6 +99,13 @@ type model struct {
 	localFileFinder chan gitcha.SearchResult
 }
 
+// pagerSubmode reports whether the pager has an active submode (TOC panel
+// visible or search active) that should consume navigation keys before the
+// top level handles them.
+func pagerSubmode(m model) bool {
+	return m.state == stateShowDocument && (m.pager.toc.visible() || m.pager.search.IsSearching())
+}
+
 // unloadDocument unloads a document from the pager. Note that while this
 // method alters the model we also need to send along any commands returned.
 func (m *model) unloadDocument() []tea.Cmd {
@@ -153,6 +160,11 @@ func newModel(cfg Config, content string) tea.Model {
 			Note:      stripAbsolutePath(path, cwd),
 			Modtime:   info.ModTime(),
 		}
+		// 讀取並存入原始內容（供 TOC / 搜尋 / 複製使用；重新載入時由
+		// loadLocalMarkdown 更新）。Init 會再讀一次用於渲染。
+		if content, err := os.ReadFile(path); err == nil {
+			m.pager.currentDocument.Body = string(utils.RemoveFrontmatter(content))
+		}
 	}
 
 	return m
@@ -194,6 +206,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyPressMsg:
 		switch msg.String() {
 		case "esc":
+			if pagerSubmode(m) {
+				// TOC / 搜尋開啟時 esc 交給 pager 關閉子模式，
+				// 而不是直接回文件列表
+				break
+			}
 			if m.state == stateShowDocument || m.stash.viewState == stashStateLoadingDocument {
 				batch := m.unloadDocument()
 				return m, tea.Batch(batch...)
@@ -211,6 +228,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "q":
+			if pagerSubmode(m) {
+				// 搜尋 / TOC 開啟時 q 交給 pager 結束子模式，
+				// 避免輸入 q 直接離開程式
+				break
+			}
 			var cmd tea.Cmd
 
 			switch m.state { //nolint:exhaustive
@@ -225,6 +247,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 
 		case "left", "h", "delete":
+			if pagerSubmode(m) {
+				// TOC / 搜尋開啟時 left/h 交給 pager，
+				// 避免輸入 h 直接回文件列表
+				break
+			}
 			if m.state == stateShowDocument {
 				cmds = append(cmds, m.unloadDocument()...)
 				return m, tea.Batch(cmds...)

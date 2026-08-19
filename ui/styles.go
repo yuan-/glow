@@ -45,6 +45,15 @@ type Styles struct {
 	helpViewStyle                  func(...string) string
 	lineNumberStyle                func(...string) string
 
+	// TOC panel styles
+	tocTitleStyle    lipgloss.Style
+	tocSelectedStyle lipgloss.Style
+	tocHintStyle     lipgloss.Style
+	tocPanelStyle    lipgloss.Style
+
+	// Search row styles
+	searchInfoStyle lipgloss.Style
+
 	dividerDot            lipgloss.Style
 	dividerBar            lipgloss.Style
 	logoStyle             lipgloss.Style
@@ -143,6 +152,29 @@ func newStyles(isDark bool) Styles {
 	s.lineNumberStyle = lipgloss.NewStyle().
 		Foreground(lineNumberFg).
 		Render
+
+	// TOC styles
+	s.tocTitleStyle = lipgloss.NewStyle().
+		Bold(true).
+		Foreground(mintGreen)
+
+	s.tocSelectedStyle = lipgloss.NewStyle().
+		Reverse(true).
+		Bold(true)
+
+	s.tocHintStyle = lipgloss.NewStyle().
+		Foreground(statusBarNoteFg)
+
+	s.tocPanelStyle = lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(s.fuchsia).
+		Padding(1, 2).
+		Background(statusBarBg)
+
+	// Search styles
+	s.searchInfoStyle = lipgloss.NewStyle().
+		Bold(true).
+		Foreground(mintGreen)
 
 	// Stash styles
 	s.dividerDot = s.darkGrayFg.SetString(" • ")
