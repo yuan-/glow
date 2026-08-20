@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -48,11 +49,110 @@ func newTestPager(t *testing.T, body, rendered string, w, h int) pagerModel {
 	m := newPagerModel(common)
 	m.viewport.SetWidth(w)
 	m.viewport.SetHeight(h - 1)
-	m.currentDocument = markdown{Body: body, Note: "test.md"}
+	m.currentDocument = markdown{Body: body, Note: "test.md", localPath: "/test.md"}
 	m.tocRaw = body
 	m.tocRendered = rendered
 	m.setContent(rendered)
+	m.bookmarks = newBookmarkStoreAt(filepath.Join(t.TempDir(), "bookmarks.json"))
 	return m
+}
+
+// TestPagerBookmarkFlow 驗證 bookmark 的記錄（m）、f2/f3 跳躍、
+// 以及 enter 開啟列表 → 移動 → 跳轉 → 關閉的流程。
+func TestPagerBookmarkFlow(t *testing.T) {
+	body, rendered := buildTestDoc(12)
+	m := newTestPager(t, body, rendered, 80, 20)
+
+	// 沒有 bookmark 時 f2/f3 應顯示狀態訊息且不移動
+	m, _ = m.update(keySpecial(tea.KeyF3))
+	if m.viewport.YOffset() != 0 || m.statusMessage != "No bookmarks" {
+		t.Fatalf("YOffset=%d status=%q", m.viewport.YOffset(), m.statusMessage)
+	}
+	m, _ = m.update(keySpecial(tea.KeyF2))
+	if m.statusMessage != "No bookmarks" {
+		t.Fatalf("status=%q", m.statusMessage)
+	}
+
+	// 捲到行 10（Section 2 標題）並按 m 記錄 bookmark
+	m.setViewportTo(10)
+	m, _ = m.update(keyRune('m'))
+	if m.statusMessage != "Bookmark saved: Section 2" {
+		t.Fatalf("status = %q, want \"Bookmark saved: Section 2\"", m.statusMessage)
+	}
+
+	// 同行重複記錄 → 提示已存在
+	m, _ = m.update(keyRune('m'))
+	if m.statusMessage != "Bookmark already saved here" {
+		t.Fatalf("status = %q", m.statusMessage)
+	}
+
+	// 再記錄一個在行 11 的 bookmark（標籤同樣是上方的 Section 2）
+	m.setViewportTo(11)
+	m, _ = m.update(keyRune('m'))
+	if m.statusMessage != "Bookmark saved: Section 2" {
+		t.Fatalf("status = %q", m.statusMessage)
+	}
+
+	// f2 → 上一個 bookmark（行 10）
+	m, _ = m.update(keySpecial(tea.KeyF2))
+	if m.viewport.YOffset() != 10 || m.statusMessage != "Bookmark: Section 2" {
+		t.Fatalf("YOffset=%d status=%q", m.viewport.YOffset(), m.statusMessage)
+	}
+
+	// f3 → 下一個 bookmark（行 11）
+	m, _ = m.update(keySpecial(tea.KeyF3))
+	if m.viewport.YOffset() != 11 {
+		t.Fatalf("YOffset=%d, want 11", m.viewport.YOffset())
+	}
+
+	// f3 再按一次 → 沒有下一個
+	m, _ = m.update(keySpecial(tea.KeyF3))
+	if m.viewport.YOffset() != 11 || m.statusMessage != "No next bookmark" {
+		t.Fatalf("YOffset=%d status=%q", m.viewport.YOffset(), m.statusMessage)
+	}
+
+	// enter 開啟 bookmark 列表
+	m, _ = m.update(keySpecial(tea.KeyEnter))
+	if !m.bookmarkList.visible || len(m.bookmarkList.items) != 2 {
+		t.Fatalf("list visible=%v items=%d", m.bookmarkList.visible, len(m.bookmarkList.items))
+	}
+	// 列表開啟時 View 應繪製面板且總高度不變
+	view := m.View()
+	if lines := strings.Count(view, "\n"); lines+1 != 20 {
+		t.Errorf("view height = %d lines, want 20", lines+1)
+	}
+	if !strings.Contains(view, "Bookmarks") {
+		t.Error("bookmark panel should be visible in View()")
+	}
+
+	// 列表開啟時其他按鍵不應洩漏（例如 g 不跳到頂端）
+	m, _ = m.update(keyRune('g'))
+	if m.viewport.YOffset() != 11 || !m.bookmarkList.visible {
+		t.Fatalf("g while list open: YOffset=%d visible=%v", m.viewport.YOffset(), m.bookmarkList.visible)
+	}
+
+	// j 選中第二個 → enter 跳轉並關閉
+	m, _ = m.update(keyRune('j'))
+	if m.bookmarkList.sel != 1 {
+		t.Fatalf("sel=%d, want 1", m.bookmarkList.sel)
+	}
+	m, _ = m.update(keySpecial(tea.KeyEnter))
+	if m.bookmarkList.visible {
+		t.Error("list should close after enter")
+	}
+	if m.viewport.YOffset() != 11 {
+		t.Errorf("YOffset=%d, want 11", m.viewport.YOffset())
+	}
+
+	// 重新開啟後 esc 應只關閉列表
+	m, _ = m.update(keySpecial(tea.KeyEnter))
+	m, _ = m.update(keySpecial(tea.KeyEscape))
+	if m.bookmarkList.visible {
+		t.Error("list should close after esc")
+	}
+	if m.viewport.YOffset() != 11 {
+		t.Errorf("YOffset=%d, want 11 (unchanged)", m.viewport.YOffset())
+	}
 }
 
 // TestPagerTocFlow 驗證 TOC 的開啟、上下移動、Enter 跳轉流程。
@@ -196,6 +296,39 @@ func TestPagerSearchFlow(t *testing.T) {
 		if strings.TrimRight(got[i], " ") != rlines[i] {
 			t.Errorf("restored line %d = %q, want %q", i, got[i], rlines[i])
 		}
+	}
+}
+
+// TestPagerBookmarkLabel 驗證 bookmark 標籤的決定邏輯：
+// 上方最近標題 → 目前列文字片段 → "line N"。
+func TestPagerBookmarkLabel(t *testing.T) {
+	body, rendered := buildTestDoc(12)
+	m := newTestPager(t, body, rendered, 80, 20)
+
+	// 行 11 上方最近的標題是 Section 2（行 10）
+	m.setViewportTo(11)
+	if got := m.bookmarkLabel(); got != "Section 2" {
+		t.Fatalf("label = %q, want \"Section 2\"", got)
+	}
+
+	// 行 4 上方最近的標題是 Title（行 1）
+	m.setViewportTo(4)
+	if got := m.bookmarkLabel(); got != "Title" {
+		t.Fatalf("label = %q, want \"Title\"", got)
+	}
+
+	// 沒有標題的文件 → 用目前列文字片段（文件要夠長才能捲動）
+	plainBody := strings.Repeat("plain text line\n", 30)
+	plain := newTestPager(t, plainBody, plainBody, 80, 20)
+	plain.setViewportTo(1)
+	if got := plain.bookmarkLabel(); got != "plain text line" {
+		t.Fatalf("label = %q, want \"plain text line\"", got)
+	}
+
+	// 空列 → "line N"
+	empty := newTestPager(t, "", "", 80, 20)
+	if got := empty.bookmarkLabel(); got != "line 1" {
+		t.Fatalf("label = %q, want \"line 1\"", got)
 	}
 }
 

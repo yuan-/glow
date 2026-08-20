@@ -94,29 +94,47 @@ type model struct {
 	stash stashModel
 	pager pagerModel
 
+	// Bookmarks（跨文件共享，持久化到磁碟）
+	bookmarks *bookmarkStore
+
+	// 記住每個檔案的捲動位置（僅限本次執行期間）：路徑 → 渲染內容行號
+	positionMem map[string]int
+
 	// Channel that receives paths to local markdown files
 	// (via the github.com/muesli/gitcha package)
 	localFileFinder chan gitcha.SearchResult
 }
 
-// pagerSubmode reports whether the pager has an active submode (TOC panel
-// visible or search active) that should consume navigation keys before the
+// pagerSubmode reports whether the pager has an active submode (TOC panel,
+// search, or bookmark list) that should consume navigation keys before the
 // top level handles them.
 func pagerSubmode(m model) bool {
-	return m.state == stateShowDocument && (m.pager.toc.visible() || m.pager.search.IsSearching())
+	return m.state == stateShowDocument &&
+		(m.pager.toc.visible() || m.pager.search.IsSearching() || m.pager.bookmarkList.visible)
 }
 
 // unloadDocument unloads a document from the pager. Note that while this
 // method alters the model we also need to send along any commands returned.
 func (m *model) unloadDocument() []tea.Cmd {
+	// 離開前記住目前捲動位置（再回來時還原）
+	if m.state == stateShowDocument && m.pager.currentDocument.localPath != "" {
+		m.positionMem[m.pager.currentDocument.localPath] = m.pager.viewport.YOffset()
+	}
 	m.state = stateShowStash
 	m.stash.viewState = stashStateReady
 	m.pager.unload()
 	m.pager.showHelp = false
+	// 清空目前文件，讓「重新進入同一檔案」可以區別於「重新載入同一檔案」
+	m.pager.currentDocument = markdown{}
 
 	var batch []tea.Cmd
 	if !m.stash.shouldSpin() {
 		batch = append(batch, m.stash.spinner.Tick)
+	}
+	// 本地文件搜尋尚未啟動過（例如直接指定檔案啟動）：
+	// 現在啟動，讓回文件列表時內容已就緒
+	if !m.stash.loaded {
+		batch = append(batch, findLocalFiles(*m.common))
 	}
 	return batch
 }
@@ -128,11 +146,14 @@ func newModel(cfg Config, content string) tea.Model {
 	}
 
 	m := model{
-		common: &common,
-		state:  stateShowStash,
-		pager:  newPagerModel(&common),
-		stash:  newStashModel(&common),
+		common:      &common,
+		state:       stateShowStash,
+		pager:       newPagerModel(&common),
+		stash:       newStashModel(&common),
+		bookmarks:   newBookmarkStore(),
+		positionMem: make(map[string]int),
 	}
+	m.pager.bookmarks = m.bookmarks
 
 	path := cfg.Path
 	if path == "" && content != "" {
@@ -279,7 +300,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case fetchedMarkdownMsg:
 		// We've loaded a markdown file's contents for rendering
+		curPath := m.pager.currentDocument.localPath
 		m.pager.currentDocument = *msg
+		// 記住的捲動位置：
+		// - 重新載入同一檔案（r / 編輯後）→ 保持在目前位置
+		// - 重新進入同一檔案 → 還原上次離開的位置
+		if msg.localPath != "" {
+			if msg.localPath == curPath {
+				m.pager.pendingRestoreY = m.pager.viewport.YOffset()
+			} else if y, ok := m.positionMem[msg.localPath]; ok {
+				m.pager.pendingRestoreY = y
+			}
+		}
 		body := string(utils.RemoveFrontmatter([]byte(msg.Body)))
 		cmds = append(cmds, renderWithGlamour(m.pager, body))
 
@@ -380,6 +412,9 @@ func findLocalFiles(m commonModel) tea.Cmd {
 			info, err = os.Stat(cwd)
 			if err == nil && info.IsDir() {
 				cwd, err = filepath.Abs(cwd)
+			} else if err == nil && !info.IsDir() {
+				// 直接指定檔案啟動時：以該檔案所在目錄為搜尋根
+				cwd, err = filepath.Abs(filepath.Dir(cwd))
 			}
 		}
 

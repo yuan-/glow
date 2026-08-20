@@ -64,6 +64,13 @@ type pagerModel struct {
 	// Search support
 	search        SearchModel
 	preSearchYOff int // 啟動搜尋前的捲動位置，結束搜尋時還原
+
+	// Bookmark support
+	bookmarks    *bookmarkStore
+	bookmarkList bookmarkListModel
+
+	// pendingRestoreY 渲染完成後要還原的捲動位置（記住位置功能）
+	pendingRestoreY int
 }
 
 func newPagerModel(common *commonModel) pagerModel {
@@ -228,6 +235,146 @@ func (m *pagerModel) setViewportTo(line int) {
 	m.viewport.SetYOffset(line)
 }
 
+// currentFilePath 回傳目前文件的本地路徑（pipe 內容時為空）。
+func (m *pagerModel) currentFilePath() string {
+	return m.currentDocument.localPath
+}
+
+// statusMsgs 產生一個顯示狀態訊息的 command 批次。
+func (m *pagerModel) statusMsgs(text string) []tea.Cmd {
+	return []tea.Cmd{m.showStatusMessage(pagerStatusMessage{text, false})}
+}
+
+// bookmarkLabel 決定 bookmark 標籤：優先用目前畫面「上方最近」的標題
+// （透過 TOC 標題位置計算）；找不到標題時用目前列的文字片段。
+func (m *pagerModel) bookmarkLabel() string {
+	y := m.viewport.YOffset()
+
+	headings := m.toc.headings
+	if len(headings) == 0 && m.tocRaw != "" {
+		headings = utils.ExtractHeadings(m.tocRaw)
+	}
+	if len(headings) > 0 && m.tocRendered != "" {
+		lineOf := utils.FindHeadingLines(m.tocRendered, headings)
+		best := -1
+		for i, line := range lineOf {
+			if line >= 0 && line <= y && (best == -1 || line > lineOf[best]) {
+				best = i
+			}
+		}
+		if best >= 0 {
+			label := headings[best].Text
+			if runewidth.StringWidth(label) > 40 {
+				label = truncate.String(label, 40)
+			}
+			return label
+		}
+	}
+
+	// 上方沒有標題：用目前列的文字片段
+	lines := strings.Split(m.tocRendered, "\n")
+	if y < len(lines) {
+		text := strings.TrimSpace(stripANSI(lines[y]))
+		if text != "" {
+			if runewidth.StringWidth(text) > 40 {
+				text = truncate.String(text, 40)
+			}
+			return text
+		}
+	}
+	return fmt.Sprintf("line %d", y+1)
+}
+
+// saveBookmark 將目前畫面位置記錄為 bookmark。
+func (m *pagerModel) saveBookmark() []tea.Cmd {
+	path := m.currentFilePath()
+	if path == "" || m.bookmarks == nil {
+		return m.statusMsgs("Bookmark unavailable (not a local file)")
+	}
+	label := m.bookmarkLabel()
+	added, err := m.bookmarks.add(path, m.viewport.YOffset(), label)
+	switch {
+	case err != nil:
+		log.Error("error saving bookmark", "path", path, "error", err)
+		return m.statusMsgs("Bookmark error")
+	case !added:
+		return m.statusMsgs("Bookmark already saved here")
+	}
+	return m.statusMsgs("Bookmark saved: " + label)
+}
+
+// jumpBookmark 跳到上一個 (dir<0) / 下一個 (dir>0) bookmark。
+func (m *pagerModel) jumpBookmark(dir int) []tea.Cmd {
+	path := m.currentFilePath()
+	if path == "" || m.bookmarks == nil {
+		return m.statusMsgs("No bookmarks (not a local file)")
+	}
+	items := m.bookmarks.forFile(path)
+	if len(items) == 0 {
+		return m.statusMsgs("No bookmarks")
+	}
+
+	cur := m.viewport.YOffset()
+	var target *bookmarkInfo
+	if dir > 0 {
+		for i := range items {
+			if items[i].Y > cur {
+				target = &items[i]
+				break
+			}
+		}
+	} else {
+		for i := len(items) - 1; i >= 0; i-- {
+			if items[i].Y < cur {
+				target = &items[i]
+				break
+			}
+		}
+	}
+	if target == nil {
+		if dir > 0 {
+			return m.statusMsgs("No next bookmark")
+		}
+		return m.statusMsgs("No previous bookmark")
+	}
+
+	m.setViewportTo(target.Y)
+	return m.statusMsgs("Bookmark: " + target.Label)
+}
+
+// openBookmarkList 開啟 bookmark 列表（ctrl+m/enter 鍵）。
+func (m *pagerModel) openBookmarkList() []tea.Cmd {
+	path := m.currentFilePath()
+	if path == "" || m.bookmarks == nil {
+		return m.statusMsgs("No bookmarks (not a local file)")
+	}
+	items := m.bookmarks.forFile(path)
+	if len(items) == 0 {
+		return m.statusMsgs("No bookmarks")
+	}
+	m.bookmarkList.open(items, m.currentDocument.Note, max(1, m.viewport.Height()-6))
+	return nil
+}
+
+// handleBookmarkKey 處理 bookmark 列表開啟時的鍵盤輸入（消費所有按鍵）。
+func (m *pagerModel) handleBookmarkKey(key string) []tea.Cmd {
+	var cmds []tea.Cmd
+	switch key {
+	case "up", "k":
+		m.bookmarkList.moveSel(-1)
+	case "down", "j":
+		m.bookmarkList.moveSel(1)
+	case keyEnter:
+		if bm := m.bookmarkList.selected(); bm != nil {
+			m.setViewportTo(bm.Y)
+		}
+		m.bookmarkList.closeList()
+	case keyEsc, "q":
+		m.bookmarkList.closeList()
+	}
+	return cmds
+}
+
 func (m *pagerModel) toggleHelp() {
 	m.showHelp = !m.showHelp
 	m.setSize(m.common.width, m.common.height)
@@ -267,6 +414,8 @@ func (m *pagerModel) unload() {
 	m.state = pagerStateBrowse
 	m.toc.closeToc()
 	m.search.StopSearch()
+	m.bookmarkList.closeList()
+	m.pendingRestoreY = 0
 	m.viewport.SetContent("")
 	m.viewport.SetYOffset(0)
 	m.unwatchFile()
@@ -292,6 +441,11 @@ func (m pagerModel) update(msg tea.Msg) (pagerModel, tea.Cmd) {
 
 		if m.search.IsSearching() {
 			cmds = append(cmds, m.handleSearchKey(msg)...)
+			return m, tea.Batch(cmds...)
+		}
+
+		if m.bookmarkList.visible {
+			cmds = append(cmds, m.handleBookmarkKey(key)...)
 			return m, tea.Batch(cmds...)
 		}
 
@@ -356,6 +510,21 @@ func (m pagerModel) update(msg tea.Msg) (pagerModel, tea.Cmd) {
 			m.search.StartSearch(renderedContent)
 			m.applyLayout()
 			cmds = append(cmds, textinput.Blink)
+
+		// Bookmark: 按下 m 記錄目前位置
+		case "m":
+			cmds = append(cmds, m.saveBookmark()...)
+
+		// Bookmark: f2/f3 跳到上/下一個 bookmark
+		case "f2":
+			cmds = append(cmds, m.jumpBookmark(-1)...)
+		case "f3":
+			cmds = append(cmds, m.jumpBookmark(1)...)
+
+		// 終端裡 ctrl+m 與 enter 是同一個鍵（0x0D）：
+		// 常規模式下 enter 開啟 bookmark 列表
+		case keyEnter:
+			cmds = append(cmds, m.openBookmarkList()...)
 		}
 
 	// Glow has rendered the content
@@ -371,6 +540,11 @@ func (m pagerModel) update(msg tea.Msg) (pagerModel, tea.Cmd) {
 			m.toc.refresh(m.tocRendered)
 		}
 		m.setContent(m.tocRendered)
+		if m.pendingRestoreY > 0 {
+			// 記住的捲動位置：渲染完成後還原
+			m.setViewportTo(m.pendingRestoreY)
+			m.pendingRestoreY = 0
+		}
 		if m.search.IsSearching() {
 			// 內容已重新渲染，舊的匹配位置無效：以新內容重建搜尋
 			m.search.StartSearch(m.tocRendered)
@@ -432,22 +606,13 @@ func (m pagerModel) View() string {
 		rows = rows[:areaH]
 	}
 
-	// 繪製 TOC 浮動面板：貼在 viewport 內容「上方」（置中），而不是追加到螢幕外
+	// 繪製浮動面板（TOC / bookmark 列表）：貼在 viewport 內容「上方」（置中），
+	// 而不是追加到螢幕外
 	if m.toc.visible() {
-		panel := m.toc.panel(m.common.width, areaH, m.common.styles)
-		if panel != "" {
-			plines := strings.Split(panel, "\n")
-			pw := runewidth.StringWidth(plines[0])
-			x := max(0, (m.common.width-pw)/2)
-			y := max(0, (areaH-len(plines))/2)
-			for i, l := range plines {
-				r := y + i
-				if r >= areaH {
-					break
-				}
-				rows[r] = strings.Repeat(" ", x) + truncate.String(l, uint(m.common.width-x))
-			}
-		}
+		m.pastePanel(rows, m.toc.panel(m.common.width, areaH, m.common.styles), areaH)
+	}
+	if m.bookmarkList.visible {
+		m.pastePanel(rows, m.bookmarkList.panel(m.common.width, areaH, m.common.styles), areaH)
 	}
 
 	b.WriteString(strings.Join(rows, "\n"))
@@ -471,6 +636,24 @@ func (m pagerModel) View() string {
 	}
 
 	return b.String()
+}
+
+// pastePanel 將浮動面板貼上 viewport 內容（水平與垂直置中）。
+func (m *pagerModel) pastePanel(rows []string, panel string, areaH int) {
+	if panel == "" {
+		return
+	}
+	plines := strings.Split(panel, "\n")
+	pw := runewidth.StringWidth(plines[0])
+	x := max(0, (m.common.width-pw)/2)
+	y := max(0, (areaH-len(plines))/2)
+	for i, l := range plines {
+		r := y + i
+		if r >= areaH {
+			break
+		}
+		rows[r] = strings.Repeat(" ", x) + truncate.String(l, uint(max(0, m.common.width-x)))
+	}
 }
 
 // searchLineView 繪製搜尋輸入列（提示字元 + 輸入框 + 匹配資訊 + 快捷鍵提示）。
@@ -570,26 +753,38 @@ func (m pagerModel) statusBarView(b *strings.Builder) {
 }
 
 func (m pagerModel) helpView() (s string) {
-	col1 := []string{
-		"g/home  go to top",
-		"G/end   go to bottom",
-		"c       copy contents",
-		"e       edit this document",
-		"r       reload this document",
-		"esc     back to files",
-		"q       quit",
+	type binding struct{ key, desc string }
+	bindings := []binding{
+		{"k/↑", "up"},
+		{"j/↓", "down"},
+		{"g/home", "go to top"},
+		{"G/end", "go to bottom"},
+		{"b/pgup", "page up"},
+		{"f/pgdn", "page down"},
+		{"u", "½ page up"},
+		{"d", "½ page down"},
+		{"t", "table of contents"},
+		{"/", "search"},
+		{"n/N", "next/prev match"},
+		{"m", "save bookmark"},
+		{"f2/f3", "prev/next bookmark"},
+		{"enter", "bookmark list (ctrl+m)"},
+		{"c", "copy contents"},
+		{"e", "edit this document"},
+		{"r", "reload this document"},
+		{"?", "toggle help"},
+		{"esc", "back to files"},
+		{"q", "quit"},
 	}
 
+	const keyW, descW, gap = 8, 26, 2
+	rows := (len(bindings) + 1) / 2
 	s += "\n"
-	s += "k/↑      up                  " + col1[0] + "\n"
-	s += "j/↓      down                " + col1[1] + "\n"
-	s += "b/pgup   page up             " + col1[2] + "\n"
-	s += "f/pgdn   page down           " + col1[3] + "\n"
-	s += "u        ½ page up           " + col1[4] + "\n"
-	s += "d        ½ page down         "
-
-	if len(col1) > 5 {
-		s += col1[5]
+	for i := 0; i < rows; i++ {
+		l := bindings[i]
+		r := bindings[rows+i]
+		s += fmt.Sprintf("%-*s  %-*s%s%-*s  %-*s\n",
+			keyW, l.key, descW, l.desc, strings.Repeat(" ", gap), keyW, r.key, descW, r.desc)
 	}
 
 	s = indent(s, 2)
